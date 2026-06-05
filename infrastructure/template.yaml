@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lumen — Complete infrastructure stack.
+  Static website (S3 + CloudFront) + Contact form API (Lambda + API Gateway).
+
+Parameters:
+  TelegramChatId:
+    Type: String
+    Default: '1205531086'
+    Description: Telegram chat ID for contact form notifications
+  TelegramSecretName:
+    Type: String
+    Default: 'lumen/telegram-bot-token'
+    Description: Secrets Manager secret name for Telegram bot token
+
+Resources:
+
+  # ============================================================
+  # S3 — Static Website Hosting
+  # ============================================================
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 'lumen-website-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ============================================================
+  # CloudFront — CDN + HTTPS
+  # ============================================================
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: lumen-website-oac
+        Description: OAC for Lumen static website
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: lumen-security-headers
+        Comment: Security headers for Lumen website
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            Override: true
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            Override: true
+            FrameOption: DENY
+          XSSProtection:
+            Override: true
+            Protection: true
+            ModeBlock: true
+          ReferrerPolicy:
+            Override: true
+            ReferrerPolicy: strict-origin-when-cross-origin
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: >-
+              default-src 'none';
+              script-src 'self';
+              style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+              font-src 'self' https://fonts.gstatic.com;
+              img-src 'self' data:;
+              connect-src 'self';
+              form-action 'self';
+              frame-ancestors 'none';
+              base-uri 'self';
+              upgrade-insecure-requests
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Lumen — Technology. Security. Trust.
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+        Origins:
+          # S3 static website
+          - Id: s3-website
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref OriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+
+          # API Gateway — contact form
+          - Id: api-contact
+            DomainName: !Sub '${ContactApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSslProtocols:
+                - TLSv1.2
+            CustomHeaders:
+              - HeaderName: x-origin-verify
+                HeaderValue: '{{resolve:ssm-secure:/lumen/prod/origin-verify-secret}}'
+
+        DefaultCacheBehavior:
+          TargetOriginId: s3-website
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+
+        CacheBehaviors:
+          - PathPattern: /api/contact
+            TargetOriginId: api-contact
+            ViewerProtocolPolicy: https-only
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponsePagePath: /index.html
+            ResponseCode: '200'
+            ErrorCachingMinTTL: 60
+          - ErrorCode: 404
+            ResponsePagePath: /index.html
+            ResponseCode: '200'
+            ErrorCachingMinTTL: 60
+
+  # ============================================================
+  # Lambda — Contact Form Handler
+  # ============================================================
+  ContactFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: lumen-contact-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: lumen-contact-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:lumen/*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lumen/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+                  StringLike:
+                    kms:EncryptionContext:PARAMETER_ARN: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/lumen/*'
+
+  # NOTE: After first deploy, update ALLOWED_ORIGIN with the actual CloudFront domain:
+  #   aws lambda update-function-configuration --function-name lumen-contact-api \
+  #     --environment "Variables={...,ALLOWED_ORIGIN=https://<cf-domain>}"
+  # The origin-verify header is the primary security control; CORS is defense-in-depth.
+  ContactFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lumen-contact-api
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 15
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt ContactFunctionRole.Arn
+      Code:
+        ZipFile: |
+          // Placeholder — deploy real code via: aws lambda update-function-code
+          export const handler = async () => ({ statusCode: 503, body: '{"error":"Deploy code first"}' });
+      Environment:
+        Variables:
+          TELEGRAM_CHAT_ID: !Ref TelegramChatId
+          TELEGRAM_SECRET_NAME: !Ref TelegramSecretName
+          ALLOWED_ORIGIN: 'https://lumen.cloudfront.net'
+
+  ContactFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/lumen-contact-api
+      RetentionInDays: 30
+
+  # ============================================================
+  # API Gateway HTTP API
+  # ============================================================
+  ContactApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: lumen-contact-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - 'https://*.cloudfront.net'
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+        MaxAge: 86400
+
+  ContactApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ContactApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ContactFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  ContactApiRoutePost:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ContactApi
+      RouteKey: 'POST /api/contact'
+      Target: !Sub 'integrations/${ContactApiIntegration}'
+
+  ContactApiRouteOptions:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ContactApi
+      RouteKey: 'OPTIONS /api/contact'
+      Target: !Sub 'integrations/${ContactApiIntegration}'
+
+  ContactApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ContactApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+
+  ContactApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ContactFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ContactApi}/*'
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  WebsiteUrl:
+    Description: CloudFront website URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID (for cache invalidation)
+    Value: !Ref CloudFrontDistribution
+
+  ApiEndpoint:
+    Description: API Gateway endpoint (contact form)
+    Value: !GetAtt ContactApi.ApiEndpoint
+
+  S3BucketName:
+    Description: S3 bucket for website files
+    Value: !Ref WebsiteBucket
+
+  ContactFormEndpoint:
+    Description: Contact form submission URL
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/api/contact'
